@@ -3,10 +3,22 @@
 
 use memvid_core::{
     EmbeddingIdentitySummary, MEMVID_EMBEDDING_MODEL_KEY, MEMVID_EMBEDDING_PROVIDER_KEY, Memvid,
-    MemvidError, PutOptions, TimelineQuery,
+    MemvidError, PutOptions, TimelineQuery, constants::HEADER_SIZE, io::header::HeaderCodec,
 };
+use std::fs::File;
+use std::io::Read;
 use std::num::NonZeroU64;
+use std::path::Path;
 use tempfile::TempDir;
+
+fn read_wal_size(path: &Path) -> u64 {
+    let mut header_bytes = [0u8; HEADER_SIZE];
+    File::open(path)
+        .unwrap()
+        .read_exact(&mut header_bytes)
+        .unwrap();
+    HeaderCodec::decode(&header_bytes).unwrap().wal_size
+}
 
 /// Test basic put operation with bytes.
 #[test]
@@ -433,4 +445,96 @@ fn timeline_iteration() {
     let entries = mem.timeline(query).unwrap();
 
     assert_eq!(entries.len(), 3, "Should have 3 timeline entries");
+}
+
+/// Regression test for memvid/memvid#230 — sustained commit-per-put workloads
+/// that span multiple WAL growth cycles must keep the embedded WAL intact.
+///
+/// Before the fix, `grow_wal_region` / `ensure_wal_capacity` updated
+/// `header.footer_offset` and `self.data_end` after shifting the data region
+/// but left the cached `payload_region_end()` value stale. The next call to
+/// `rebuild_indexes` then sought to that pre-growth offset (which now lies
+/// inside the grown WAL region) and overwrote WAL record payloads, producing
+/// `Embedded WAL is corrupted at offset N: wal record checksum mismatch` on
+/// the following commit.
+#[test]
+fn commit_per_put_survives_wal_growth() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("wal_growth.mv2");
+
+    // Capture the initial WAL size from a freshly created, then closed, store.
+    // The header is read with no writer open so it never races the store's
+    // file lock — on Windows a held byte-range lock makes a second handle's
+    // read fail with "another process has locked a portion of the file".
+    let initial_wal_size = {
+        let mem = Memvid::create(&path).unwrap();
+        drop(mem);
+        read_wal_size(&path)
+    };
+
+    // Use text-indexable payloads of varying length so each commit drives the
+    // full Tantivy rebuild path (`rebuild_indexes` → `flush_tantivy`) that
+    // seeks to `payload_region_end()`. The mix of sizes ensures multiple
+    // WAL growth cycles occur across the run.
+    let words: &[&str] = &[
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+        "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra",
+        "tango", "uniform", "victor", "whiskey", "x-ray", "yankee", "zulu",
+    ];
+
+    let doc_count = 24u32;
+    let frames_written;
+    {
+        let mut mem = Memvid::open(&path).unwrap();
+        for i in 0..doc_count {
+            // Ramp the body size from ~4 KiB up past the initial 64 KiB WAL
+            // region so the run deterministically crosses several
+            // `grow_wal_region` cycles (rather than relying on incidental
+            // wrap/checkpoint timing). Each commit then runs `rebuild_indexes`,
+            // which seeks to `payload_region_end()` — the path #230 corrupted.
+            let body_len = 4096usize + (i as usize) * 6144;
+            let mut body = String::with_capacity(body_len + 16);
+            let mut idx = i as usize;
+            while body.len() < body_len {
+                body.push_str(words[idx % words.len()]);
+                body.push(' ');
+                idx = idx.wrapping_add(1);
+            }
+            let opts = PutOptions {
+                uri: Some(format!("mv2://wal-growth/doc-{i}")),
+                title: Some(format!("doc-{i}")),
+                search_text: Some(body.clone()),
+                ..Default::default()
+            };
+            mem.put_bytes_with_options(body.as_bytes(), opts)
+                .unwrap_or_else(|e| panic!("put #{i} failed: {e}"));
+            mem.commit()
+                .unwrap_or_else(|e| panic!("commit #{i} failed: {e}"));
+        }
+        // Large `search_text` bodies are chunked, so each doc yields one or
+        // more frames; capture the true total before closing.
+        frames_written = mem.stats().unwrap().frame_count;
+        // mem dropped here, releasing the file lock before we read the header.
+    }
+
+    // The WAL region only ever grows, so reading the size once the writer is
+    // closed reflects the maximum it reached during the run.
+    let final_wal_size = read_wal_size(&path);
+    assert!(
+        final_wal_size > initial_wal_size,
+        "test must exercise WAL growth (initial={initial_wal_size}, final={final_wal_size})"
+    );
+
+    // Reopening forces a full WAL scan; checksum verification will fire here
+    // if any record payload was clobbered by a stale-offset index write.
+    assert!(
+        frames_written >= u64::from(doc_count),
+        "expected at least one frame per doc (got {frames_written} for {doc_count} docs)"
+    );
+    let reopened = Memvid::open_read_only(&path).unwrap();
+    assert_eq!(
+        reopened.stats().unwrap().frame_count,
+        frames_written,
+        "all frames should be durable after WAL growth"
+    );
 }
